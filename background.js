@@ -1,8 +1,5 @@
 /**
  * CIS DEL Helper Extension - Background Script
- * 
- * A Chrome extension to help students access CIS DEL more efficiently
- * Handles login, announcement fetching, and notifications.
  */
 
 // ======================================================================
@@ -16,38 +13,70 @@ const CONFIG = {
     announcements: 'https://cis.del.ac.id/tmbh/pengumuman/pengumuman-browse'
   },
   cache: {
-    announcementExpiryMs: 5 * 60 * 1000, // 5 minutes
-    checkIntervalMinutes: 15
+    announcementExpiryMs: 900 * 1000, // 30 detik (untuk cache)
+    checkIntervalSeconds: 900, // Check setiap 30 detik
+    backupIntervalMinutes: 1 // Backup alarm setiap 1 menit (minimum Chrome alarm)
   },
-  debug: true // Set to false in production
+  notifications: {
+    enabled: true,
+    iconUrl: '/icons/icon128.png',
+    clickAction: 'openAnnouncements'
+  },
+  debug: true
 };
 
 // ======================================================================
 // UTILITIES & HELPERS
 // ======================================================================
 
-/**
- * Custom logger with levels
- */
+// ID untuk interval timer
+let checkIntervalId = null;
+
 const Logger = {
   log: function(message, ...data) {
-    if (CONFIG.debug) console.log(`[CIS Helper] ${message}`, ...data);
+    if (CONFIG.debug) {
+      console.log(`[CIS Helper] ${message}`, ...data);
+      // Simpan log ke storage untuk debugging
+      const logMessage = `${new Date().toISOString()} - ${message}`;
+      saveLogToStorage(logMessage);
+    }
   },
   error: function(message, ...data) {
-    if (CONFIG.debug) console.error(`[CIS Helper] ${message}`, ...data);
-  },
-  info: function(message, ...data) {
-    if (CONFIG.debug) console.info(`[CIS Helper] ${message}`, ...data);
-  },
-  warn: function(message, ...data) {
-    if (CONFIG.debug) console.warn(`[CIS Helper] ${message}`, ...data);
+    if (CONFIG.debug) {
+      console.error(`[CIS Helper] ${message}`, ...data);
+      // Simpan error log ke storage
+      const logMessage = `${new Date().toISOString()} - ERROR: ${message}`;
+      saveLogToStorage(logMessage);
+    }
   }
 };
 
-/**
- * Dapatkan standard headers untuk request
- * @returns {Object} Headers untuk HTTP request
- */
+// Simpan log ke storage dengan jumlah terbatas
+async function saveLogToStorage(message) {
+  try {
+    const data = await getFromStorage(['debugLogs']);
+    let logs = data.debugLogs || [];
+    logs.push(message);
+    
+    // Batasi jumlah log (simpan 100 log terakhir)
+    if (logs.length > 100) {
+      logs = logs.slice(-100);
+    }
+    
+    saveToStorage({ debugLogs: logs });
+  } catch (error) {
+    console.error('Error saving log:', error);
+  }
+}
+
+function updateIntervalFromSettings(newInterval) {
+  // Hapus alarm lama, buat alarm baru
+  chrome.alarms.clear('checkCIS', () => {
+    chrome.alarms.create('checkCIS', { periodInMinutes: Math.max(newInterval / 60, 0.5) });
+  });
+  // Jika pakai setInterval, clearInterval lalu setInterval baru
+}
+
 function getStandardHeaders() {
   return {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -58,58 +87,27 @@ function getStandardHeaders() {
   };
 }
 
-/**
- * Bersihkan teks dari karakter yang tidak diinginkan
- * @param {string} text - Teks yang akan dibersihkan
- * @returns {string} Teks yang sudah dibersihkan
- */
 function cleanText(text) {
   if (!text) return '';
   return text.replace(/\s+/g, ' ').trim();
 }
 
-/**
- * Bersihkan karakter encoding yang tidak benar
- * @param {string} text - Teks yang akan dibersihkan
- * @returns {string} Teks yang sudah dibersihkan
- */
-function cleanEncodingIssues(text) {
-  if (!text) return '';
-
-  // Perbaiki encoding untuk karakter umum yang sering bermasalah
-  return text
-    .replace(/â€¢/g, '•')    // Bullet point
-    .replace(/â€"/g, '-')    // Em dash
-    .replace(/â€"/g, '–')    // En dash
-    .replace(/â€œ/g, '"')    // Double quote kiri
-    .replace(/â€/g, '"')     // Double quote kanan
-    .replace(/Â /g, ' ')     // Non-breaking space
-    .replace(/â€‹/g, '')     // Zero width space
-    .replace(/&amp;/g, '&')  // Ampersand
-    .replace(/&lt;/g, '<')   // Less than
-    .replace(/&gt;/g, '>')   // Greater than
-    .trim();
-}
-
-/**
- * Simpan data ke storage lokal
- * @param {Object} data - Data yang akan disimpan
- * @returns {Promise} Promise yang menandakan keberhasilan
- */
 function saveToStorage(data) {
   return new Promise((resolve) => {
     chrome.storage.local.set(data, () => {
-      Logger.log('Data tersimpan', data);
+      if (CONFIG.debug && !data.debugLogs) { // Don't log debugLogs to avoid recursion
+        console.log('Data tersimpan:', data);
+      }
       resolve(true);
     });
   });
 }
 
-/**
- * Ambil data dari storage lokal
- * @param {Array|string} keys - Keys yang akan diambil
- * @returns {Promise<Object>} Promise berisi data yang diminta
- */
+chrome.storage.local.get(['interval_check'], function(data) {
+  let interval = data.interval_check || 30;
+  updateIntervalFromSettings(interval);
+});
+
 function getFromStorage(keys) {
   return new Promise((resolve) => {
     chrome.storage.local.get(keys, (data) => {
@@ -118,13 +116,61 @@ function getFromStorage(keys) {
   });
 }
 
-/**
- * Delay function
- * @param {number} ms - Delay dalam milidetik
- * @returns {Promise} Promise yang resolve setelah delay
- */
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ======================================================================
+// INTERVAL & ALARM MANAGEMENT
+// ======================================================================
+
+/**
+ * Setup interval timer untuk pengecekan setiap 30 detik
+ */
+function setupCheckInterval() {
+  // Clear interval yang sudah ada jika ada
+  if (checkIntervalId) {
+    clearInterval(checkIntervalId);
+  }
+  
+  // Setup interval baru setiap 30 detik
+  checkIntervalId = setInterval(() => {
+    Logger.log(`Interval timer triggered (every ${CONFIG.cache.checkIntervalSeconds}s)`);
+    checkAnnouncements();
+  }, CONFIG.cache.checkIntervalSeconds * 1000);
+  
+  Logger.log(`Interval setup: cek setiap ${CONFIG.cache.checkIntervalSeconds} detik`);
+  
+  // Simpan status interval ke storage
+  saveToStorage({ 
+    intervalSetupTime: Date.now(),
+    intervalSeconds: CONFIG.cache.checkIntervalSeconds
+  });
+}
+
+/**
+ * Setup alarm sebagai backup (jika service worker di-terminate)
+ */
+function setupBackupAlarm() {
+  // Hapus alarm yang mungkin sudah ada
+  chrome.alarms.clear('checkCIS', (wasCleared) => {
+    Logger.log(`Alarm lama ${wasCleared ? 'berhasil dihapus' : 'tidak ditemukan'}`);
+    
+    // Buat alarm baru (minimal 1 menit sesuai batasan Chrome)
+    chrome.alarms.create('checkCIS', { 
+      periodInMinutes: CONFIG.cache.backupIntervalMinutes
+    });
+    
+    // Verifikasi alarm berhasil dibuat
+    chrome.alarms.getAll((alarms) => {
+      const cisAlarm = alarms.find(a => a.name === 'checkCIS');
+      if (cisAlarm) {
+        Logger.log('Alarm backup berhasil dibuat', cisAlarm);
+      } else {
+        Logger.error('Gagal membuat alarm backup!');
+      }
+    });
+  });
 }
 
 // ======================================================================
@@ -133,8 +179,6 @@ function delay(ms) {
 
 /**
  * Simpan status login
- * @param {string} username - Username yang berhasil login
- * @returns {Promise} Promise menandakan keberhasilan
  */
 async function saveLoginState(username) {
   return await saveToStorage({ 
@@ -146,9 +190,6 @@ async function saveLoginState(username) {
 
 /**
  * Login dengan metode tab (paling reliable)
- * @param {string} username - Username CIS
- * @param {string} password - Password CIS
- * @returns {Promise<boolean>} Status keberhasilan login
  */
 async function loginWithTabMethod(username, password) {
   return new Promise((resolve) => {
@@ -158,11 +199,8 @@ async function loginWithTabMethod(username, password) {
     }, async (tab) => {
       try {
         Logger.log("Tab dibuat, menunggu halaman dimuat...");
-
-        // Tunggu halaman dimuat
         await delay(3000);
 
-        // Inject script untuk mengisi form
         chrome.scripting.executeScript({
           target: { tabId: tab.id },
           function: injectLoginForm,
@@ -176,8 +214,6 @@ async function loginWithTabMethod(username, password) {
           }
 
           Logger.log("Form disubmit, menunggu proses login...");
-
-          // Tunggu proses login (5 detik)
           await delay(5000);
           
           try {
@@ -196,6 +232,8 @@ async function loginWithTabMethod(username, password) {
 
             if (success) {
               await saveLoginState(username);
+              // Inisiasi pengecekan pengumuman setelah login berhasil
+              checkAnnouncements();
             }
 
             chrome.tabs.remove(tab.id);
@@ -217,119 +255,31 @@ async function loginWithTabMethod(username, password) {
 
 /**
  * Fungsi yang diinject ke tab untuk mengisi form login
- * @param {Object} credentials - Username dan password
- * @returns {boolean} Status keberhasilan pengisian form
  */
 function injectLoginForm(credentials) {
   console.log("Script diinject, mengisi form login...");
 
-  // Cari elemen form
   const usernameField = document.querySelector('input[name="LoginForm[username]"]');
   const passwordField = document.querySelector('input[name="LoginForm[password]"]');
   const rememberMeField = document.querySelector('input[name="LoginForm[rememberMe]"]');
   const form = document.querySelector('form');
-
-  console.log("Elemen form:", { 
-    usernameField: !!usernameField, 
-    passwordField: !!passwordField,
-    form: !!form
-  });
 
   if (!usernameField || !passwordField || !form) {
     console.error("Elemen form login tidak ditemukan!");
     return false;
   }
 
-  // Isi form
   usernameField.value = credentials.username;
   passwordField.value = credentials.password;
   if (rememberMeField) rememberMeField.checked = true;
 
-  // Submit form
   console.log("Mengirim form...");
   form.submit();
   return true;
 }
 
 /**
- * Login dengan fetch API (cadangan, kurang reliable)
- * @param {string} username - Username CIS
- * @param {string} password - Password CIS
- * @returns {Promise<boolean>} Status keberhasilan login
- */
-async function loginWithFetch(username, password) {
-  try {
-    Logger.log('Memulai login via fetch untuk user:', username);
-
-    // Ambil CSRF token
-    const loginPage = await fetch(CONFIG.urls.login, {
-      method: 'GET',
-      credentials: 'include',
-      headers: getStandardHeaders()
-    });
-
-    Logger.log('Status response halaman login:', loginPage.status);
-    
-    if (!loginPage.ok) {
-      Logger.error('Gagal mengakses halaman login:', loginPage.status);
-      return false;
-    }
-    
-    const loginHtml = await loginPage.text();
-
-    // Parse CSRF token
-    const csrfTokenMatch = loginHtml.match(/<input type="hidden" name="_csrf" value="([^"]+)">/);
-    if (!csrfTokenMatch) {
-      Logger.error('CSRF token tidak ditemukan');
-      return false;
-    }
-    const csrfToken = csrfTokenMatch[1];
-    Logger.log('CSRF token didapat:', csrfToken);
-
-    // Buat form data
-    const formData = new URLSearchParams();
-    formData.append('_csrf', csrfToken);
-    formData.append('LoginForm[username]', username);
-    formData.append('LoginForm[password]', password);
-    formData.append('LoginForm[rememberMe]', '0');
-
-    Logger.log('Form data disiapkan, mencoba login...');
-
-    // Kirim request login
-    const loginResponse = await fetch(CONFIG.urls.login, {
-      method: 'POST',
-      body: formData,
-      credentials: 'include',
-      redirect: 'follow',
-      headers: {
-        ...getStandardHeaders(),
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Origin': 'https://cis.del.ac.id',
-        'Referer': CONFIG.urls.login
-      }
-    });
-
-    Logger.log('URL response login:', loginResponse.url);
-    Logger.log('Status response login:', loginResponse.status);
-
-    // Cek hasil login
-    const isSuccess = loginResponse.url.includes('/dashboard');
-    Logger.log('Login berhasil?', isSuccess);
-
-    if (isSuccess) {
-      await saveLoginState(username);
-    }
-
-    return isSuccess;
-  } catch (error) {
-    Logger.error('Error login via fetch:', error);
-    return false;
-  }
-}
-
-/**
  * Cek status login dengan cookies
- * @returns {Promise<boolean>} Status login saat ini
  */
 async function checkLoginWithCookies() {
   try {
@@ -366,20 +316,17 @@ async function checkLoginWithCookies() {
 
 /**
  * Ambil pengumuman dari CIS
- * @returns {Promise<Object>} Hasil pengambilan pengumuman
  */
 async function fetchAnnouncements() {
   try {
     Logger.log('Mengambil pengumuman...');
 
-    // Cek login dulu
     const isLoggedIn = await checkLoginWithCookies();
     if (!isLoggedIn) {
       Logger.log('Belum login, tidak bisa ambil pengumuman');
       return { success: false, error: 'Belum login', announcements: [] };
     }
 
-    // Langsung gunakan metode tab untuk mengambil pengumuman
     return await fetchAnnouncementsWithTab();
   } catch (error) {
     Logger.error('Error ambil pengumuman:', error);
@@ -389,26 +336,21 @@ async function fetchAnnouncements() {
 
 /**
  * Ambil pengumuman langsung dari halaman CIS menggunakan tab
- * @returns {Promise<Object>} Hasil pengambilan pengumuman
  */
 function fetchAnnouncementsWithTab() {
   return new Promise((resolve) => {
-    // Buka tab untuk mengambil pengumuman
     chrome.tabs.create({ 
       url: CONFIG.urls.announcements, 
       active: false 
     }, async (tab) => {
       try {
         Logger.log("Tab pengumuman dibuat, menunggu halaman dimuat...");
-
-        // Tunggu halaman dimuat
         await delay(5000);
 
-        // Inject script untuk mengambil pengumuman
         chrome.scripting.executeScript({
           target: { tabId: tab.id },
           function: extractAnnouncementsFromPage
-        }, (results) => {
+        }, async (results) => {
           try {
             chrome.tabs.remove(tab.id);
 
@@ -425,14 +367,16 @@ function fetchAnnouncementsWithTab() {
 
             const { announcements, pageTitle } = results[0].result;
             Logger.log(`Berhasil mengambil ${announcements.length} pengumuman dari tab`);
-            Logger.log('Judul halaman:', pageTitle);
 
-            // Simpan pengumuman ke storage
-            saveToStorage({ 
+            // Simpan pengumuman ke storage bersama timestamp
+            await saveToStorage({ 
               announcements: announcements,
               lastAnnouncementFetch: Date.now(),
               directUrl: CONFIG.urls.announcements
             });
+
+            // Periksa untuk pengumuman baru dan tampilkan notifikasi
+            await compareAndNotifyNewAnnouncements(announcements);
 
             resolve({ 
               success: true, 
@@ -465,12 +409,10 @@ function fetchAnnouncementsWithTab() {
 
 /**
  * Fungsi yang dieksekusi di halaman CIS untuk ekstrak pengumuman
- * @returns {Object} Daftar pengumuman dan informasi halaman
  */
 function extractAnnouncementsFromPage() {
-  console.log("Extracting announcements from page:", document.title);
+  console.log("Mengekstrak pengumuman dari halaman:", document.title);
   
-  // Use your simple function that works in console
   function extractAnnouncements() {
     const container = document.querySelector('.pengumuman-browse');
     if (!container) {
@@ -480,20 +422,37 @@ function extractAnnouncementsFromPage() {
     
     const announcements = [];
     
-    // Try table rows first
+    // Try to find announcement table rows
     const tableRows = container.querySelectorAll('table tbody tr');
     if (tableRows.length > 0) {
       console.log("Found announcement table rows");
       tableRows.forEach((row, index) => {
         const linkElement = row.querySelector('a');
         if (linkElement) {
+          const title = linkElement.textContent.trim();
+          const link = linkElement.href;
+          
+          // Get date if available (usually in the second or third cell)
+          const cells = row.querySelectorAll('td');
+          let date = '';
+          let sender = '';
+          
+          if (cells.length > 2) {
+            date = cells[2].textContent.trim();
+          }
+          
+          if (cells.length > 3) {
+            sender = cells[3].textContent.trim();
+          }
+          
           announcements.push({
-            id: index.toString(),
-            title: linkElement.textContent.trim(),
-            link: linkElement.href,
-            date: '',
-            sender: '',
-            read: false
+            id: `table-${index}`,
+            title: title,
+            link: link,
+            date: date,
+            sender: sender,
+            read: false,
+            addedAt: Date.now()
           });
         }
       });
@@ -501,7 +460,7 @@ function extractAnnouncementsFromPage() {
       if (announcements.length > 0) return announcements;
     }
     
-    // Try all links in the container
+    // If no table rows found, try all links in the container
     console.log("Trying all links in announcement container");
     const links = container.querySelectorAll('a');
     links.forEach((link, index) => {
@@ -510,12 +469,13 @@ function extractAnnouncementsFromPage() {
           !link.classList.contains('nav-link')) {
         
         announcements.push({
-          id: index.toString(),
+          id: `link-${index}`,
           title: link.textContent.trim(),
           link: link.href,
           date: '',
           sender: '',
-          read: false
+          read: false,
+          addedAt: Date.now()
         });
       }
     });
@@ -523,48 +483,144 @@ function extractAnnouncementsFromPage() {
     return announcements;
   }
   
-  // Run your simpler extraction function
+  // Run extraction function
   const announcements = extractAnnouncements();
-  console.log(`Found ${announcements.length} announcements`);
+  console.table(announcements);
   
-  // Return the results to the background script
+  // Return results
   return { announcements, pageTitle: document.title };
 }
 
+/**
+ * Bandingkan pengumuman baru dengan yang sudah ada dan notifikasi jika ada yang baru
+ */
+async function compareAndNotifyNewAnnouncements(newAnnouncements) {
+  Logger.log(`Membandingkan ${newAnnouncements.length} pengumuman baru dengan yang tersimpan`);
+  
+  try {
+    const data = await getFromStorage(['lastNotifiedAnnouncements']);
+    const lastAnnouncements = data.lastNotifiedAnnouncements || [];
+    
+    // Debug info
+    Logger.log(`Jumlah pengumuman tersimpan sebelumnya: ${lastAnnouncements.length}`);
+    
+    // Jika belum ada pengumuman yang disimpan sebelumnya
+    if (lastAnnouncements.length === 0) {
+      Logger.log('Tidak ada pengumuman sebelumnya. Menyimpan semua pengumuman sebagai notified.');
+      await saveToStorage({ lastNotifiedAnnouncements: newAnnouncements });
+      return;
+    }
+    
+    // Buat set dari ID pengumuman yang sudah ada
+    const existingIdentifiers = new Set();
+    lastAnnouncements.forEach(announcement => {
+      const identifier = announcement.id || 
+                        `${announcement.title}|${announcement.link || ''}`;
+      existingIdentifiers.add(identifier);
+    });
+    
+    // Filter pengumuman baru
+    const brandNewAnnouncements = newAnnouncements.filter(announcement => {
+      const identifier = announcement.id || 
+                        `${announcement.title}|${announcement.link || ''}`;
+      return !existingIdentifiers.has(identifier);
+    });
+    
+    Logger.log(`Ditemukan ${brandNewAnnouncements.length} pengumuman baru`);
+    
+    if (brandNewAnnouncements.length > 0) {
+      // Tampilkan notifikasi
+      showNotificationForNewAnnouncements(brandNewAnnouncements);
+      
+      // Update daftar pengumuman yang sudah dinotifikasi
+      await saveToStorage({ 
+        lastNotifiedAnnouncements: newAnnouncements,
+        hasUnreadAnnouncements: true,
+        newAnnouncementsCount: brandNewAnnouncements.length
+      });
+    } else {
+      Logger.log('Tidak ada pengumuman baru');
+      await saveToStorage({ lastNotifiedAnnouncements: newAnnouncements });
+    }
+  } catch (error) {
+    Logger.error('Error saat membandingkan pengumuman:', error);
+  }
+}
 
-// ======================================================================
-// BACKGROUND TASKS & SCHEDULING
-// ======================================================================
+/**
+ * Tampilkan notifikasi untuk pengumuman baru
+ */
+function showNotificationForNewAnnouncements(newAnnouncements) {
+  if (!CONFIG.notifications.enabled) {
+    Logger.log('Notifikasi dinonaktifkan dalam konfigurasi');
+    return;
+  }
+  
+  try {
+    const count = newAnnouncements.length;
+    let message;
+    
+    if (count === 1) {
+      message = `${newAnnouncements[0].title}`;
+    } else {
+      message = `Ada ${count} pengumuman baru dari CIS. Klik untuk melihat.`;
+    }
+    
+    Logger.log(`Menampilkan notifikasi untuk ${count} pengumuman baru`);
+    
+    // Buat notifikasi dengan ID tertentu agar bisa diganti jika ada yang baru
+    const notificationId = 'cis-new-announcements';
+    
+    chrome.notifications.create(notificationId, {
+      type: 'basic',
+      iconUrl: CONFIG.notifications.iconUrl,
+      title: 'Pengumuman CIS Baru',
+      message: message,
+      priority: 2,
+      requireInteraction: true
+    }, (createdId) => {
+      if (chrome.runtime.lastError) {
+        Logger.error('Error membuat notifikasi:', chrome.runtime.lastError);
+        return;
+      }
+      
+      Logger.log(`Notifikasi berhasil dibuat dengan ID: ${createdId}`);
+      
+      // Simpan timestamp notifikasi untuk debugging
+      saveToStorage({ 
+        lastNotificationTime: Date.now(),
+        lastNotificationCount: count
+      });
+    });
+  } catch (error) {
+    Logger.error('Error menampilkan notifikasi:', error);
+  }
+}
 
 /**
  * Cek pengumuman secara berkala
- * @returns {Promise<boolean>} Status keberhasilan cek
  */
 async function checkAnnouncements() {
+  // Simpan waktu pengecekan untuk debugging
+  await saveToStorage({ 
+    lastCheckTime: Date.now(),
+    checkStatus: 'starting'
+  });
+  
+  Logger.log('Memulai pengecekan pengumuman CIS...');
+  
   try {
     // Cek login dulu
     const isLoggedIn = await checkLoginWithCookies();
-
-    if (!isLoggedIn) {
-      // Coba untuk login otomatis jika ada kredensial
-      const loginData = await getFromStorage(['username', 'password']);
-      if (!loginData.username || !loginData.password) {
-        Logger.log('Tidak dapat cek pengumuman: kredensial tidak ada');
-        return false;
-      }
-
-      Logger.log('Mencoba login otomatis dengan kredensial tersimpan');
-      const loginSuccess = await loginWithTabMethod(loginData.username, loginData.password);
-      if (!loginSuccess) {
-        Logger.log('Gagal login otomatis, tidak dapat cek pengumuman');
-        return false;
-      }
-    }
-
-    // Ambil pengumuman yang tersimpan untuk perbandingan
-    const storedData = await getFromStorage(['announcements', 'lastAnnouncementFetch']);
     
-    // Jika cache masih valid, gunakan itu
+    if (!isLoggedIn) {
+      Logger.log('Belum login, tidak dapat cek pengumuman');
+      await saveToStorage({ checkStatus: 'failed-not-logged-in' });
+      return false;
+    }
+    
+    // Periksa apakah cache masih valid
+    const storedData = await getFromStorage(['announcements', 'lastAnnouncementFetch']);
     const cacheExpiry = CONFIG.cache.announcementExpiryMs;
     const now = Date.now();
     
@@ -572,156 +628,214 @@ async function checkAnnouncements() {
         storedData.lastAnnouncementFetch && 
         (now - storedData.lastAnnouncementFetch < cacheExpiry)) {
       
-      Logger.log('Menggunakan cache pengumuman (masih valid)');
-      await showNewAnnouncementsNotification(storedData.announcements);
+      Logger.log('Cache pengumuman masih valid, menggunakan data cache');
+      await saveToStorage({ checkStatus: 'using-cache' });
+      
+      // Gunakan data cache untuk perbandingan
+      await compareAndNotifyNewAnnouncements(storedData.announcements);
       return true;
     }
     
-    // Cache sudah tidak valid, ambil pengumuman baru
-    Logger.log('Cache tidak valid atau tidak ada, mengambil pengumuman baru');
+    // Cache tidak valid, ambil pengumuman baru
+    Logger.log('Mengambil pengumuman baru dari CIS...');
     const result = await fetchAnnouncements();
     
-    if (result.success && result.announcements.length > 0) {
-      // Tampilkan notifikasi jika ada pengumuman baru
-      await showNewAnnouncementsNotification(result.announcements);
-      Logger.log('Berhasil cek dan update pengumuman');
+    if (result.success) {
+      Logger.log(`Berhasil mengambil ${result.announcements.length} pengumuman`);
+      await saveToStorage({ checkStatus: 'success' });
       return true;
     } else {
-      Logger.warn('Gagal mengambil pengumuman baru:', result.error || 'Unknown error');
-      return false;
-    }
-  } catch (error) {
-    Logger.error('Error cek pengumuman:', error);
-    return false;
-  }
-}
-
-/**
- * Tampilkan notifikasi untuk pengumuman baru
- * @param {Array} announcements - Daftar pengumuman
- * @returns {Promise<boolean>} Status keberhasilan tampilkan notifikasi
- */
-async function showNewAnnouncementsNotification(announcements) {
-  try {
-    // Dapatkan pengumuman tersimpan untuk dibandingkan
-    const data = await getFromStorage(['lastNotifiedAnnouncements']);
-    const lastAnnouncements = data.lastNotifiedAnnouncements || [];
-
-    // Cari pengumuman baru (yang belum ada di daftar sebelumnya)
-    const lastIds = new Set(lastAnnouncements.map(a => a.id));
-    const newAnnouncements = announcements.filter(a => !lastIds.has(a.id));
-
-    if (newAnnouncements.length > 0) {
-      Logger.log(`Ditemukan ${newAnnouncements.length} pengumuman baru`);
-      
-      // Tampilkan notifikasi
-      chrome.notifications.create({
-        type: 'basic',
-        iconUrl: '/icon128.png',
-        title: 'Pengumuman CIS Baru',
-        message: `Ada ${newAnnouncements.length} pengumuman baru dari CIS. Klik untuk melihat.`,
-        priority: 2
+      Logger.warn('Gagal mengambil pengumuman:', result.error);
+      await saveToStorage({ 
+        checkStatus: 'failed-fetch-error',
+        lastError: result.error
       });
-
-      // Simpan daftar terbaru untuk perbandingan selanjutnya
-      await saveToStorage({ lastNotifiedAnnouncements: announcements });
-      return true;
-    } else {
-      Logger.log('Tidak ada pengumuman baru');
       return false;
     }
   } catch (error) {
-    Logger.error('Error tampilkan notifikasi:', error);
+    Logger.error('Error pada pengecekan pengumuman:', error);
+    await saveToStorage({ 
+      checkStatus: 'failed-exception',
+      lastError: String(error)
+    });
     return false;
   }
 }
 
 // ======================================================================
-// EVENT LISTENERS
+// EVENT LISTENERS & INITIALIZATION
 // ======================================================================
 
-// Set up alarm untuk cek berkala
-chrome.alarms.create('checkCIS', { 
-  periodInMinutes: CONFIG.cache.checkIntervalMinutes 
+// Listener untuk instalasi/update/startup ekstensi
+chrome.runtime.onInstalled.addListener((details) => {
+  Logger.log(`Ekstensi ${details.reason}: ${details.reason === 'install' ? 'baru diinstal' : 'diperbarui'}`);
+  
+  // Setup mekanisme pengecekan berkala
+  setupCheckInterval();
+  setupBackupAlarm();
+  
+  if (details.reason === 'install') {
+    // Inisialisasi storage untuk instalasi baru
+    saveToStorage({
+      isLoggedIn: false,
+      lastAnnouncementFetch: 0,
+      announcements: [],
+      lastNotifiedAnnouncements: [],
+      hasUnreadAnnouncements: false,
+      installTime: Date.now()
+    });
+    
+    // Jalankan pengecekan pertama kali setelah instalasi (5 detik)
+    setTimeout(() => {
+      checkAnnouncements();
+    }, 5000);
+  }
 });
 
-// Listener untuk alarm
+// Ensure timers are setup when browser starts
+chrome.runtime.onStartup.addListener(() => {
+  Logger.log('Browser dimulai, memastikan timer dan alarm terdaftar');
+  setupCheckInterval();
+  setupBackupAlarm();
+});
+
+// Listener untuk alarm (backup jika service worker direstart)
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'checkCIS') {
-    Logger.log('Menjalankan cek berkala pengumuman CIS');
+    Logger.log('Backup alarm triggered');
+    
+    // Simpan waktu alarm dipicu
+    saveToStorage({ 
+      lastAlarmTime: Date.now(),
+      alarmName: alarm.name
+    });
+    
+    // Pastikan timer interval masih berjalan
+    if (!checkIntervalId) {
+      Logger.log('Interval timer tidak berjalan, setup ulang');
+      setupCheckInterval();
+    }
+    
+    // Jalankan pengecekan pengumuman
     checkAnnouncements();
   }
 });
 
 // Listener untuk klik notifikasi
-chrome.notifications.onClicked.addListener(() => {
-  chrome.tabs.create({ url: CONFIG.urls.announcements });
-});
-
-// Listener untuk instalasi/update ekstension
-chrome.runtime.onInstalled.addListener(async (details) => {
-  if (details.reason === 'install') {
-    Logger.log('Ekstensi baru diinstal');
-    // Bisa lakukan inisialisasi di sini
-    await saveToStorage({
-      isLoggedIn: false,
-      lastAnnouncementFetch: 0,
-      announcements: []
-    });
-  } else if (details.reason === 'update') {
-    Logger.log('Ekstensi diperbarui ke versi baru');
-    // Bisa lakukan migrasi data di sini jika diperlukan
+chrome.notifications.onClicked.addListener((notificationId) => {
+  Logger.log(`Notifikasi dengan ID ${notificationId} diklik`);
+  
+  if (CONFIG.notifications.clickAction === 'openAnnouncements') {
+    chrome.tabs.create({ url: CONFIG.urls.announcements });
+  } else {
+    chrome.action.openPopup();
   }
+  
+  // Tandai pengumuman sudah dibaca
+  saveToStorage({ 
+    hasUnreadAnnouncements: false,
+    lastNotificationClickTime: Date.now()
+  });
 });
 
-// Listener untuk pesan dari popup atau content scripts
+// Listener untuk pesan dari popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Handler untuk mengupdate interval dari pengaturan
+  if (message.action === 'setIntervalCheck') {
+    chrome.storage.local.set({ interval_check: message.value });
+    if (typeof updateIntervalFromSettings === 'function') {
+      updateIntervalFromSettings(message.value);
+    }
+    sendResponse({ success: true });
+  }
+
   // Handler login
   if (message.action === 'login') {
     const { username, password } = message;
-
-    // Store only username, not password for better security
-    // Password will be used only for the login attempt
+    
     saveToStorage({ username }).then(async () => {
       const success = await loginWithTabMethod(username, password);
-
-      if (!success) {
-        Logger.log('Login gagal dengan tab method, mencoba dengan fetch...');
-        const fetchSuccess = await loginWithFetch(username, password);
-        sendResponse({ success: fetchSuccess });
-      } else {
-        sendResponse({ success });
-      }
+      sendResponse({ success });
     });
-
+    
     return true; // Akan merespon secara asynchronous
   }
-
+  
   // Handler cek login
   if (message.action === 'checkLogin') {
     checkLoginWithCookies().then(isLoggedIn => {
       sendResponse({ isLoggedIn });
     });
-    return true; // Akan merespon secara asynchronous
+    return true;
   }
-
+  
   // Handler login manual
   if (message.action === 'manualLogin') {
     chrome.tabs.create({ url: CONFIG.urls.login, active: true });
     sendResponse({ success: true });
   }
-
+  
   // Handler ambil pengumuman
   if (message.action === 'fetchAnnouncements') {
     fetchAnnouncements().then(result => {
       sendResponse(result);
     });
-    return true; // Akan merespon secara asynchronous
+    return true;
   }
-
+  
+  // Handler untuk perintah checkAnnouncements manual dari popup
+  if (message.action === 'checkAnnouncements') {
+    Logger.log('Manual check requested from popup');
+    checkAnnouncements().then(result => {
+      sendResponse({ success: result });
+    });
+    return true;
+  }
+  
+  // Handler tandai semua pengumuman telah dibaca
+  if (message.action === 'markAllAsRead') {
+    saveToStorage({ hasUnreadAnnouncements: false }).then(() => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+  
+  // Handler untuk debugging
+  if (message.action === 'getDebugInfo') {
+    getFromStorage([
+      'debugLogs', 
+      'lastCheckTime', 
+      'lastAlarmTime', 
+      'intervalSetupTime',
+      'checkStatus',
+      'lastError'
+    ]).then(data => {
+      // Tambahkan informasi tentang interval timer
+      data.checkIntervalRunning = !!checkIntervalId;
+      data.checkIntervalSeconds = CONFIG.cache.checkIntervalSeconds;
+      sendResponse(data);
+    });
+    return true;
+  }
+  
   // Debugging - buka halaman pengumuman di tab baru
   if (message.action === 'openAnnouncementsPage') {
     chrome.tabs.create({ url: CONFIG.urls.announcements });
     sendResponse({ success: true });
   }
 });
+
+// Mulai setup timer interval dan backup alarm saat service worker dimulai
+Logger.log('Service worker started. Setting up timers and alarms...');
+setupCheckInterval();
+setupBackupAlarm();
+
+// Debug: cek dan log semua alarm
+chrome.alarms.getAll(alarms => {
+  Logger.log('Current alarms:', alarms);
+});
+
+// Jalankan pengecekan awal saat service worker dimulai
+setTimeout(() => {
+  checkAnnouncements();
+}, 5000);

@@ -5,12 +5,38 @@ document.addEventListener('DOMContentLoaded', function() {
   // Login functionality
   setupLoginForm();
 
+  // Interval setting
+  setupIntervalSetting();
+
   // Load initial content for active tab
   const activeTab = document.querySelector('.tab.active').getAttribute('data-tab');
   if (activeTab === 'announcements') {
     loadAnnouncements();
   }
 });
+
+// Fungsi pengaturan interval
+function setupIntervalSetting() {
+  const intervalInput = document.getElementById('interval_check');
+  if (!intervalInput) return;
+
+  // Load nilai interval dari storage saat popup dibuka
+  chrome.storage.local.get(['interval_check'], function(data) {
+    if (data.interval_check && !isNaN(data.interval_check)) {
+      intervalInput.value = data.interval_check;
+    }
+  });
+
+  // Saat user mengubah interval, simpan dan kirim ke background
+  intervalInput.addEventListener('change', function() {
+    let val = parseInt(intervalInput.value, 10);
+    if (isNaN(val) || val < 30) val = 30;
+    intervalInput.value = val;
+
+    chrome.storage.local.set({ interval_check: val });
+    chrome.runtime.sendMessage({ action: 'setIntervalCheck', value: val });
+  });
+}
 
 // Tab navigation setup
 function setupTabs() {
@@ -52,9 +78,13 @@ function setupLoginForm() {
   const loginStatus = document.getElementById('login-status');
 
   // Load saved username if any
-  chrome.storage.local.get(['username', 'isLoggedIn'], function(data) {
+  chrome.storage.local.get(['username', 'password', 'isLoggedIn'], function(data) {
     if (data.username) {
       usernameInput.value = data.username;
+    }
+
+    if (data.password) {
+      passwordInput.value = data.password;
     }
 
     if (data.isLoggedIn) {
@@ -124,17 +154,29 @@ function setupLoginForm() {
   });
 }
 
+let cachedAnnouncements = null;
+
 // Load announcements
 function loadAnnouncements(forceRefresh = false) {
   const announcementsList = document.getElementById('announcements-list');
-  announcementsList.innerHTML = '<div class="loading">Memuat pengumuman...</div>';
 
-  // Set up refresh button
-  document.getElementById('refresh-announcements-btn').addEventListener('click', function() {
-    loadAnnouncements(true);
-  });
+  // Tampilkan cache di memory jika ada dan bukan forceRefresh
+  if (cachedAnnouncements && !forceRefresh) {
+    displayAnnouncements(cachedAnnouncements);
+  } else {
+    announcementsList.innerHTML = '<div class="loading">Memuat pengumuman...</div>';
+  }
 
-  // Check login status first
+  // Set up refresh button (hindari multiple event listener)
+  const refreshBtn = document.getElementById('refresh-announcements-btn');
+  if (refreshBtn && !refreshBtn._listenerSet) {
+    refreshBtn.addEventListener('click', function() {
+      loadAnnouncements(true);
+    });
+    refreshBtn._listenerSet = true;
+  }
+
+  // Cek status login terlebih dahulu
   chrome.runtime.sendMessage({ action: 'checkLogin' }, function(loginResponse) {
     if (!loginResponse || !loginResponse.isLoggedIn) {
       announcementsList.innerHTML = `
@@ -143,33 +185,53 @@ function loadAnnouncements(forceRefresh = false) {
           <button id="goto-login-tab" style="margin-top: 10px;">Go to Login</button>
         </div>
       `;
-
       document.getElementById('goto-login-tab').addEventListener('click', function() {
-        // Switch to login tab
         document.querySelector('.tab[data-tab="login"]').click();
       });
-
       return;
     }
 
-    // If not forcing refresh, try to get from cache first
+    // Jika tidak force refresh, coba ambil dari storage dulu
     if (!forceRefresh) {
       chrome.storage.local.get(['announcements', 'lastAnnouncementFetch'], function(data) {
-        if (data.announcements && data.lastAnnouncementFetch && 
-            (Date.now() - data.lastAnnouncementFetch < 5 * 60 * 1000)) { // 5 minutes cache
+        if (data.announcements && data.lastAnnouncementFetch &&
+            (Date.now() - data.lastAnnouncementFetch < 5 * 60 * 1000)) { // 5 menit cache
+          cachedAnnouncements = data.announcements;
           displayAnnouncements(data.announcements);
           return;
         }
-
-        // No valid cache, fetch fresh data
+        // Tidak ada cache valid, fetch data baru
         fetchAnnouncementsFromServer();
       });
     } else {
-      // Force refresh requested, fetch fresh data
+      // Force refresh, ambil data terbaru
       fetchAnnouncementsFromServer();
     }
   });
+
+  // Fungsi fetch data baru dari background
+  function fetchAnnouncementsFromServer() {
+    announcementsList.innerHTML = '<div class="loading">Mengambil pengumuman terbaru...</div>';
+    chrome.runtime.sendMessage({ action: 'fetchAnnouncements' }, function(response) {
+      if (response && response.success && response.announcements) {
+        cachedAnnouncements = response.announcements;
+        displayAnnouncements(response.announcements);
+      } else {
+        announcementsList.innerHTML = `
+          <div class="no-items">
+            Gagal mengambil pengumuman.<br>
+            Error: ${response && response.error ? response.error : 'Unknown error'}
+            <button id="open-announcements-page" style="margin-top: 10px;">Buka Halaman Pengumuman</button>
+          </div>
+        `;
+        document.getElementById('open-announcements-page').addEventListener('click', function() {
+          chrome.runtime.sendMessage({ action: 'openAnnouncementsPage' });
+        });
+      }
+    });
+  }
 }
+
 
 // Fetch announcements from server
 function fetchAnnouncementsFromServer() {
