@@ -34,8 +34,9 @@ A lightweight browser extension that helps students of Del Institute of Technolo
 git clone https://github.com/kangphp/AIO-Del-Browser-Extension.git
 
 # Navigate to project directory
+```
 cd AIO-Del-Browser-Extension
-
+```
 <!-- # Load the extension in developer mode in your browser -->
 <!-- ``` -->
 
