@@ -30,18 +30,14 @@ A lightweight browser extension that helps students of Del Institute of Technolo
 3. The extension will automatically check for announcements based on your settings
 4. Click on notifications to view full announcements
 
-## Screenshots
-
-
-![Announcements](screenshots/announh
 # Clone the repository
 git clone https://github.com/kangphp/AIO-Del-Browser-Extension.git
 
 # Navigate to project directory
 cd AIO-Del-Browser-Extension
 
-# Load the extension in developer mode in your browser
-```
+<!-- # Load the extension in developer mode in your browser -->
+<!-- ``` -->
 
 ## Tech Stack
 
